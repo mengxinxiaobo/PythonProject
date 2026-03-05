@@ -1,0 +1,85 @@
+# =========================
+# Data (DO NOT COMMIT)
+# =========================
+dataset/
+dataset_clean/
+
+# 如果未来你把数据放到别的目录，也可追加：
+# data/
+# data_raw/
+# data_clean/
+
+# =========================
+# Training outputs / caches
+# =========================
+Src/runs/
+runs/
+outputs/
+checkpoints/
+logs/
+wandb/
+
+# Numpy / cache artifacts
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# But keep small metadata if you really want:
+# (目前你 features.json / scaler.json 在 Src/runs/ 下，会被忽略)
+# 如果你希望提交这些元信息，建议改存到 Src/configs/ 或单独目录，
+# 然后在这里为其放行，例如：
+# !Src/configs/**/*.json
+
+# =========================
+# Python cache / compiled
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# =========================
+# Virtualenv / Conda
+# =========================
+.venv/
+venv/
+env/
+.conda/
+conda/
+*.egg-info/
+dist/
+build/
+
+# =========================
+# Jupyter / notebooks
+# =========================
+.ipynb_checkpoints/
+*.ipynb
+
+# =========================
+# OS / Editor / IDE
+# =========================
+.DS_Store
+Thumbs.db
+
+# PyCharm
+.idea/
+*.iml
+
+# VSCode
+.vscode/
+
+# =========================
+# Misc
+# =========================
+*.log
+*.tmp
+*.swp
+*.swo
+.cache/
