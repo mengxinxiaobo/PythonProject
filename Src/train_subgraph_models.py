@@ -117,13 +117,13 @@ def main():
     subgraph_names = list(subgraphs.keys())
     S = len(subgraph_names)
 
-    # 保存每个子图的窗口级分数（后续做 stage fusion / scheduler）
+    # 保存每个子图的窗口级分数，供后续融合与调度使用
     sub_val_mean = np.zeros((num_val, S), dtype=np.float32)
     sub_test_mean = np.zeros((num_test, S), dtype=np.float32)
     sub_val_max = np.zeros((num_val, S), dtype=np.float32)
     sub_test_max = np.zeros((num_test, S), dtype=np.float32)
 
-    # 兼容旧逻辑：保留节点级聚合残差
+    # 兼容旧评估：保留节点级聚合残差
     val_numer = np.zeros((num_val, N_total), dtype=np.float64)
     test_numer = np.zeros((num_test, N_total), dtype=np.float64)
     denom = np.zeros((N_total,), dtype=np.float64)
@@ -143,7 +143,6 @@ def main():
         print(f"\n=== Train {gname} V={V} ===")
         t0 = time.time()
 
-        # 自适应超参
         if V <= 8:
             gcn_h, lstm_h = 32, 32
             lr = 3e-4
@@ -247,7 +246,7 @@ def main():
         val_res_full = residuals_nodewise(model, val_loader, device, max_batches=None)
         test_res = residuals_nodewise(model, test_loader, device, max_batches=None)
 
-        # 子图窗口级分数：保存 mean / max 两种
+        # 子图窗口级分数
         sub_val_mean[:, s_idx] = val_res_full.mean(axis=1).astype(np.float32)
         sub_test_mean[:, s_idx] = test_res.mean(axis=1).astype(np.float32)
         sub_val_max[:, s_idx] = val_res_full.max(axis=1).astype(np.float32)
@@ -260,7 +259,7 @@ def main():
         conf_weights[gname] = conf
         print(f"{gname} conf_weight={conf:.4f}")
 
-        # 节点级聚合（兼容旧评估）
+        # 节点级聚合
         topo = topo_weights[gname].astype(np.float64)
         w = topo * conf
 
@@ -270,7 +269,7 @@ def main():
 
         print(f"{gname} done in {time.time() - t0:.1f}s")
 
-    # 节点级聚合结果（保留）
+    # 节点级聚合结果
     denom = np.maximum(denom, 1e-12)
     global_node_res_val = (val_numer / denom[None, :]).astype(np.float32)
     global_node_res_test = (test_numer / denom[None, :]).astype(np.float32)
@@ -278,7 +277,7 @@ def main():
     np.save(str(out_dir / "global_node_res_val.npy"), global_node_res_val)
     np.save(str(out_dir / "global_node_res_test.npy"), global_node_res_test)
 
-    # 子图级分数（新增）
+    # 子图级分数
     np.save(str(out_dir / "subgraph_score_val_mean.npy"), sub_val_mean)
     np.save(str(out_dir / "subgraph_score_test_mean.npy"), sub_test_mean)
     np.save(str(out_dir / "subgraph_score_val_max.npy"), sub_val_max)
@@ -290,7 +289,7 @@ def main():
     with open(out_dir / "weights.json", "w", encoding="utf-8") as f:
         json.dump({"conf_weights": conf_weights}, f, ensure_ascii=False, indent=2)
 
-    # 给一个默认 stage-fusion quick check：zscore + max + q=0.999
+    # quick baseline
     mu = sub_val_mean.mean(axis=0)
     sigma = sub_val_mean.std(axis=0) + 1e-6
     z_val = (sub_val_mean - mu) / sigma

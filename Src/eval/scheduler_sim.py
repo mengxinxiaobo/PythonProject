@@ -5,14 +5,98 @@ from pathlib import Path
 import numpy as np
 
 
+def f1_pr_recall(y_true, y_pred):
+    y_true = y_true.astype(np.int32)
+    y_pred = y_pred.astype(np.int32)
+    tp = int(((y_true == 1) & (y_pred == 1)).sum())
+    fp = int(((y_true == 0) & (y_pred == 1)).sum())
+    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+    precision = tp / (tp + fp + 1e-12)
+    recall = tp / (tp + fn + 1e-12)
+    f1 = 2 * precision * recall / (precision + recall + 1e-12)
+    return precision, recall, f1, tp, fp, fn
+
+
+def point_adjust(y_true, y_pred):
+    y_true = y_true.astype(np.int32)
+    y_pred = y_pred.astype(np.int32).copy()
+    n = len(y_true)
+    i = 0
+    while i < n:
+        if y_true[i] == 1:
+            s = i
+            while i < n and y_true[i] == 1:
+                i += 1
+            e = i
+            if np.any(y_pred[s:e] == 1):
+                y_pred[s:e] = 1
+        else:
+            i += 1
+    return y_pred
+
+
+def event_segments(y):
+    y = y.astype(np.int32)
+    segs = []
+    n = len(y)
+    i = 0
+    while i < n:
+        if y[i] == 1:
+            s = i
+            while i < n and y[i] == 1:
+                i += 1
+            segs.append((s, i))
+        else:
+            i += 1
+    return segs
+
+
+def event_level_metrics(y_true, y_pred):
+    true_segs = event_segments(y_true)
+    pred_segs = event_segments(y_pred)
+
+    matched_true = set()
+    matched_pred = set()
+
+    for pi, (ps, pe) in enumerate(pred_segs):
+        for ti, (ts, te) in enumerate(true_segs):
+            if not (pe <= ts or te <= ps):
+                matched_true.add(ti)
+                matched_pred.add(pi)
+
+    tp = len(matched_true)
+    fn = len(true_segs) - tp
+    fp = len(pred_segs) - len(matched_pred)
+
+    precision = tp / (tp + fp + 1e-12)
+    recall = tp / (tp + fn + 1e-12)
+    f1 = 2 * precision * recall / (precision + recall + 1e-12)
+    return precision, recall, f1, tp, fp, fn, len(true_segs), len(pred_segs)
+
+
+def apply_hysteresis(y_pred, H):
+    if H <= 1:
+        return y_pred.astype(np.int32)
+    y_pred = y_pred.astype(np.int32)
+    out = np.zeros_like(y_pred)
+    n = len(y_pred)
+    i = 0
+    while i < n:
+        if y_pred[i] == 1:
+            s = i
+            while i < n and y_pred[i] == 1:
+                i += 1
+            e = i
+            if (e - s) >= H:
+                out[s:e] = 1
+        else:
+            i += 1
+    return out
+
+
 def apply_hysteresis_per_col(binary_mat, H):
-    """
-    对每个子图的触发序列单独做迟滞
-    binary_mat: [T, S]
-    """
     if H <= 1:
         return binary_mat.astype(np.int32)
-
     out = np.zeros_like(binary_mat, dtype=np.int32)
     T, S = binary_mat.shape
     for s in range(S):
@@ -31,14 +115,30 @@ def apply_hysteresis_per_col(binary_mat, H):
 
 
 def pick_sentinels(A, nodes, k):
-    """
-    用子图内加权度选 Top-k 哨兵节点
-    """
     subA = A[np.ix_(nodes, nodes)]
     deg = subA.sum(axis=1)
     order = np.argsort(-deg)
     take = min(k, len(nodes))
     return [nodes[i] for i in order[:take]]
+
+
+def fuse_scores(score_mat, mode):
+    mode = mode.lower()
+    if mode == "max":
+        return score_mat.max(axis=1)
+    if mode == "mean":
+        return score_mat.mean(axis=1)
+    if mode == "top2mean":
+        k = min(2, score_mat.shape[1])
+        part = np.partition(score_mat, -k, axis=1)[:, -k:]
+        return part.mean(axis=1)
+    if mode == "top3mean":
+        k = min(3, score_mat.shape[1])
+        part = np.partition(score_mat, -k, axis=1)[:, -k:]
+        return part.mean(axis=1)
+    if mode == "p95":
+        return np.percentile(score_mat, 95, axis=1)
+    raise ValueError(f"unknown mode={mode}")
 
 
 def main():
@@ -49,9 +149,10 @@ def main():
     ap.add_argument("--score_dir", default="Src/runs/subgraph_models_stage")
     ap.add_argument("--source", default="mean", choices=["mean", "max"])
     ap.add_argument("--use_zscore", action="store_true")
+    ap.add_argument("--mode", default="max", choices=["max", "mean", "top2mean", "top3mean", "p95"])
     ap.add_argument("--quantile", type=float, default=0.999)
     ap.add_argument("--hysteresis", type=int, default=3)
-    ap.add_argument("--topk", type=int, default=2, help="number of sentinel nodes per subgraph")
+    ap.add_argument("--topk", type=int, default=2)
     ap.add_argument("--channels", type=int, default=1)
     args = ap.parse_args()
 
@@ -68,7 +169,9 @@ def main():
     with open(prep_dir / "scaler.json", "r", encoding="utf-8") as f:
         meta = json.load(f)
 
+    y_true = np.load(str(prep_dir / "test_win_labels.npy")).astype(np.int32)
     T_window = int(meta["T"])
+
     A = np.load(str(graph_dir / "A_topk.npy")).astype(np.float64)
     A = np.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
     A = np.clip(A, 0.0, None)
@@ -92,15 +195,27 @@ def main():
     N_total = len(features)
     num_test = test.shape[0]
 
-    # 每个子图单独阈值
-    thresholds = np.quantile(val, args.quantile, axis=0)  # [S]
-    triggered = (test > thresholds[None, :]).astype(np.int32)
-    modes = apply_hysteresis_per_col(triggered, args.hysteresis)  # [num_test,S]
+    # 全局检测分数
+    score_val = fuse_scores(val, args.mode)
+    score_test = fuse_scores(test, args.mode)
+    thr_global = float(np.quantile(score_val, args.quantile))
+    pred_raw = (score_test > thr_global).astype(np.int32)
+    pred_h = apply_hysteresis(pred_raw, args.hysteresis)
+    pred_pa = point_adjust(y_true, pred_h)
 
-    # 选哨兵节点
+    p1, r1, f1_1, tp1, fp1, fn1 = f1_pr_recall(y_true, pred_h)
+    p2, r2, f1_2, tp2, fp2, fn2 = f1_pr_recall(y_true, pred_pa)
+    p3, r3, f1_3, tp3, fp3, fn3, evt_true, evt_pred = event_level_metrics(y_true, pred_pa)
+
+    # 每个 stage 的单独触发（用于调度）
+    thresholds_stage = np.quantile(val, args.quantile, axis=0)
+    triggered = (test > thresholds_stage[None, :]).astype(np.int32)
+    modes = apply_hysteresis_per_col(triggered, args.hysteresis)
+
     sentinel_info = {}
     normal_nodes_per_stage = []
     full_nodes_per_stage = []
+
     for s_idx, gname in enumerate(subgraph_names):
         nodes = subgraphs[gname]["nodes"]
         sentinels = pick_sentinels(A, nodes, args.topk)
@@ -115,41 +230,34 @@ def main():
     normal_nodes_per_stage = np.array(normal_nodes_per_stage, dtype=np.int32)
     full_nodes_per_stage = np.array(full_nodes_per_stage, dtype=np.int32)
 
-    # 每个窗口的上传节点数
-    # 常态：每个 stage 上传 top-k sentinel
-    # 异常：该 stage 上传 full nodes
     nodes_uploaded = np.zeros((num_test,), dtype=np.float64)
     for t in range(num_test):
         per_stage = np.where(modes[t] == 1, full_nodes_per_stage, normal_nodes_per_stage)
         nodes_uploaded[t] = per_stage.sum()
 
-    # 通信量（按 "节点数 * 窗长 * 通道数" 近似）
     actual_load = nodes_uploaded * T_window * args.channels
     full_load = np.ones_like(actual_load) * (N_total * T_window * args.channels)
 
     avg_ratio = float(actual_load.mean() / full_load.mean())
     saved_ratio = float(1.0 - avg_ratio)
-
     trigger_ratio_global = float((modes.sum(axis=1) > 0).mean())
     trigger_ratio_per_stage = {
         subgraph_names[s]: float(modes[:, s].mean()) for s in range(S)
     }
-
-    # 一个简单的全局 score 供参考：max over stage scores
-    global_score = test.max(axis=1)
-    global_thr = float(np.quantile(val.max(axis=1), args.quantile))
-    global_pred = (global_score > global_thr).astype(np.int8)
 
     out_dir = score_dir / "scheduler_sim"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     np.save(str(out_dir / "modes.npy"), modes.astype(np.int8))
     np.save(str(out_dir / "nodes_uploaded.npy"), nodes_uploaded.astype(np.float32))
-    np.save(str(out_dir / "global_pred.npy"), global_pred.astype(np.int8))
+    np.save(str(out_dir / "pred_raw.npy"), pred_raw.astype(np.int8))
+    np.save(str(out_dir / "pred_hysteresis.npy"), pred_h.astype(np.int8))
+    np.save(str(out_dir / "pred_point_adjust.npy"), pred_pa.astype(np.int8))
 
     report = {
         "source": args.source,
         "use_zscore": bool(args.use_zscore),
+        "mode": args.mode,
         "quantile": args.quantile,
         "hysteresis": args.hysteresis,
         "topk": args.topk,
@@ -160,6 +268,12 @@ def main():
         "avg_saved_ratio_vs_full": saved_ratio,
         "global_trigger_ratio": trigger_ratio_global,
         "trigger_ratio_per_stage": trigger_ratio_per_stage,
+        "detection_pointwise": {"P": p1, "R": r1, "F1": f1_1, "TP": tp1, "FP": fp1, "FN": fn1},
+        "detection_pointadjust": {"P": p2, "R": r2, "F1": f1_2, "TP": tp2, "FP": fp2, "FN": fn2},
+        "detection_event": {
+            "P": p3, "R": r3, "F1": f1_3, "TP_evt": tp3, "FP_evt": fp3, "FN_evt": fn3,
+            "true_evt": evt_true, "pred_evt": evt_pred
+        },
         "sentinel_info": sentinel_info,
     }
 
@@ -167,10 +281,19 @@ def main():
         json.dump(report, f, ensure_ascii=False, indent=2)
 
     print("\n=== Scheduler Simulation ===")
-    print(f"source={args.source}, use_zscore={args.use_zscore}, q={args.quantile}, H={args.hysteresis}, topk={args.topk}")
+    print(
+        f"source={args.source}, use_zscore={args.use_zscore}, mode={args.mode}, "
+        f"q={args.quantile}, H={args.hysteresis}, topk={args.topk}"
+    )
     print(f"avg_upload_ratio_vs_full = {avg_ratio:.4f}")
     print(f"avg_saved_ratio_vs_full  = {saved_ratio:.4f}")
     print(f"global_trigger_ratio     = {trigger_ratio_global:.4f}")
+
+    print("\n=== Detection Metrics (same global fusion setting) ===")
+    print(f"Point-wise   : P={p1:.4f} R={r1:.4f} F1={f1_1:.4f}")
+    print(f"Point-Adjust : P={p2:.4f} R={r2:.4f} F1={f1_2:.4f}")
+    print(f"Event-level  : P={p3:.4f} R={r3:.4f} F1={f1_3:.4f}")
+
     print("saved:", str(out_dir))
 
 

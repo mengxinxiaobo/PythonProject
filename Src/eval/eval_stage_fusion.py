@@ -1,6 +1,5 @@
 # Src/eval/eval_stage_fusion.py
 import argparse
-import json
 from pathlib import Path
 import numpy as np
 
@@ -77,6 +76,7 @@ def event_level_metrics(y_true, y_pred):
 def apply_hysteresis(y_pred, H):
     if H <= 1:
         return y_pred.astype(np.int32)
+
     y_pred = y_pred.astype(np.int32)
     out = np.zeros_like(y_pred)
     n = len(y_pred)
@@ -101,7 +101,8 @@ def fuse_scores(score_mat, mode):
     if mode == "mean":
         return score_mat.mean(axis=1)
     if mode == "top2mean":
-        part = np.partition(score_mat, -2, axis=1)[:, -2:]
+        k = min(2, score_mat.shape[1])
+        part = np.partition(score_mat, -k, axis=1)[:, -k:]
         return part.mean(axis=1)
     if mode == "top3mean":
         k = min(3, score_mat.shape[1])
